@@ -69,3 +69,65 @@ class InMemoryBackend(Backend):
     def reset(self, key: str) -> None:
         with self._lock:
             self._windows.pop(key, None)
+
+
+class RedisBackend(Backend):
+    """Redis-backed sliding window backend.
+
+    Suitable for multi-process deployments (multiple uvicorn workers, gunicorn).
+    Requires the ``redis`` package: ``pip install redis``.
+
+    Args:
+        url: Redis connection URL. Defaults to ``redis://localhost:6379``.
+        prefix: Key prefix applied to all rate limit keys. Defaults to ``rl:``.
+
+    Example::
+
+        import redis
+        from fastapi_limiter.backends import RedisBackend
+
+        backend = RedisBackend(url="redis://localhost:6379")
+    """
+
+    def __init__(self, url: str = "redis://localhost:6379", prefix: str = "rl:") -> None:
+        try:
+            import redis as redis_lib
+        except ImportError as e:
+            raise ImportError(
+                "RedisBackend requires the 'redis' package. Install it with: pip install redis"
+            ) from e
+
+        self._redis = redis_lib.from_url(url, decode_responses=False)
+        self._prefix = prefix
+
+    def _full_key(self, key: str) -> str:
+        return f"{self._prefix}{key}"
+
+    def is_allowed(self, key: str, limit: int, window: int) -> tuple[bool, int, int]:
+        import time
+
+        full_key = self._full_key(key)
+        now = time.time()
+        cutoff = now - window
+
+        pipe = self._redis.pipeline()
+        pipe.zremrangebyscore(full_key, "-inf", cutoff)
+        pipe.zrange(full_key, 0, -1, withscores=True)
+        pipe.zadd(full_key, {str(now).encode(): now})
+        pipe.expire(full_key, window + 1)
+        results = pipe.execute()
+
+        existing: list[tuple[bytes, float]] = results[1]
+        count = len(existing)
+
+        if count >= limit:
+            oldest_score = existing[0][1] if existing else now
+            retry_after = int(oldest_score - cutoff) + 1
+            # undo the zadd we just did
+            self._redis.zrem(full_key, str(now).encode())
+            return False, 0, retry_after
+
+        return True, limit - count - 1, 0
+
+    def reset(self, key: str) -> None:
+        self._redis.delete(self._full_key(key))
