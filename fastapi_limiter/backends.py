@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import threading
 from abc import ABC, abstractmethod
@@ -68,6 +69,56 @@ class InMemoryBackend(Backend):
 
     def reset(self, key: str) -> None:
         with self._lock:
+            self._windows.pop(key, None)
+
+
+class AsyncInMemoryBackend:
+    """Async-native in-memory backend using asyncio.Lock.
+
+    Drop-in replacement for InMemoryBackend when running inside an async
+    context (e.g. a single uvicorn worker). Use this with ``async def``
+    key functions and async middleware. Not safe across multiple processes —
+    use RedisBackend for that.
+
+    Example::
+
+        from fastapi_limiter.backends import AsyncInMemoryBackend
+        backend = AsyncInMemoryBackend()
+    """
+
+    def __init__(self) -> None:
+        self._windows: dict[str, deque[float]] = {}
+        self._lock: asyncio.Lock | None = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def is_allowed(self, key: str, limit: int, window: int) -> tuple[bool, int, int]:
+        import time as _time
+
+        now = _time.time()
+        cutoff = now - window
+
+        async with self._get_lock():
+            if key not in self._windows:
+                self._windows[key] = deque()
+
+            timestamps = self._windows[key]
+            while timestamps and timestamps[0] < cutoff:
+                timestamps.popleft()
+
+            count = len(timestamps)
+            if count >= limit:
+                retry_after = int(timestamps[0] - cutoff) + 1
+                return False, 0, retry_after
+
+            timestamps.append(now)
+            return True, limit - count - 1, 0
+
+    async def reset(self, key: str) -> None:
+        async with self._get_lock():
             self._windows.pop(key, None)
 
 
