@@ -71,6 +71,21 @@ class InMemoryBackend(Backend):
         with self._lock:
             self._windows.pop(key, None)
 
+    def stats(self) -> list[dict]:
+        """Return current request counts for all tracked keys."""
+        now = time.time()
+        with self._lock:
+            result = []
+            for key, timestamps in self._windows.items():
+                active = [t for t in timestamps if t > now - 3600]
+                if active:
+                    result.append({
+                        "key": key,
+                        "request_count": len(active),
+                        "oldest_request_age_seconds": round(now - active[0], 1),
+                    })
+            return result
+
 
 class AsyncInMemoryBackend:
     """Async-native in-memory backend using asyncio.Lock.
@@ -120,6 +135,22 @@ class AsyncInMemoryBackend:
     async def reset(self, key: str) -> None:
         async with self._get_lock():
             self._windows.pop(key, None)
+
+    async def stats(self) -> list[dict]:
+        """Return current request counts for all tracked keys."""
+        import time as _time
+        now = _time.time()
+        async with self._get_lock():
+            result = []
+            for key, timestamps in self._windows.items():
+                active = [t for t in timestamps if t > now - 3600]
+                if active:
+                    result.append({
+                        "key": key,
+                        "request_count": len(active),
+                        "oldest_request_age_seconds": round(now - active[0], 1),
+                    })
+            return result
 
 
 class RedisBackend(Backend):
