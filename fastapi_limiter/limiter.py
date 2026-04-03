@@ -75,3 +75,91 @@ class RateLimiter:
                     "X-RateLimit-Window": str(self.window),
                 },
             )
+
+
+class BurstLimiter:
+    """FastAPI dependency that enforces both a burst and a sustained rate limit.
+
+    Allows short traffic spikes while still enforcing a long-term rate cap.
+    Both limits must pass — if either is exceeded the request is rejected.
+
+    Usage::
+
+        from fastapi import Depends
+        from fastapi_limiter import BurstLimiter
+
+        limiter = BurstLimiter(
+            burst_limit=10, burst_window=5,       # up to 10 req in 5 seconds
+            sustained_limit=60, sustained_window=60,  # up to 60 req per minute
+        )
+
+        @app.get("/search", dependencies=[Depends(limiter)])
+        async def search():
+            ...
+
+    Args:
+        burst_limit: Maximum requests allowed in the short burst window.
+        burst_window: Short window duration in seconds (e.g. 5).
+        sustained_limit: Maximum requests allowed in the sustained window.
+        sustained_window: Long window duration in seconds (e.g. 60).
+        backend: Storage backend. Defaults to a shared InMemoryBackend.
+        key_func: Callable that returns a string key from the request.
+    """
+
+    def __init__(
+        self,
+        burst_limit: int,
+        burst_window: int,
+        sustained_limit: int,
+        sustained_window: int,
+        backend: Optional[Backend] = None,
+        key_func: Optional[Callable] = None,
+    ) -> None:
+        for name, val in [
+            ("burst_limit", burst_limit), ("burst_window", burst_window),
+            ("sustained_limit", sustained_limit), ("sustained_window", sustained_window),
+        ]:
+            if val <= 0:
+                raise ValueError(f"{name} must be a positive integer")
+        if burst_window >= sustained_window:
+            raise ValueError("burst_window must be shorter than sustained_window")
+
+        self.burst_limit = burst_limit
+        self.burst_window = burst_window
+        self.sustained_limit = sustained_limit
+        self.sustained_window = sustained_window
+        self.backend = backend or _default_backend
+        self.key_func = key_func or _default_key
+
+    async def __call__(self, request: Request) -> None:
+        key = self.key_func(request)
+
+        burst_allowed, _, burst_retry = self.backend.is_allowed(
+            f"{key}:burst", self.burst_limit, self.burst_window
+        )
+        if not burst_allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Burst limit exceeded. Try again in {burst_retry}s.",
+                headers={
+                    "Retry-After": str(burst_retry),
+                    "X-RateLimit-Limit": str(self.burst_limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Window": str(self.burst_window),
+                },
+            )
+
+        sustained_allowed, _, sustained_retry = self.backend.is_allowed(
+            f"{key}:sustained", self.sustained_limit, self.sustained_window
+        )
+        if not sustained_allowed:
+            raise HTTPException(
+                status_code=429,
+                detail=f"Sustained rate limit exceeded. Try again in {sustained_retry}s.",
+                headers={
+                    "Retry-After": str(sustained_retry),
+                    "X-RateLimit-Limit": str(self.sustained_limit),
+                    "X-RateLimit-Remaining": "0",
+                    "X-RateLimit-Window": str(self.sustained_window),
+                },
+            )
