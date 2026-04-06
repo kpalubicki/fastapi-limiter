@@ -213,3 +213,67 @@ class RedisBackend(Backend):
 
     def reset(self, key: str) -> None:
         self._redis.delete(self._full_key(key))
+
+
+class AsyncRedisBackend:
+    """Async Redis-backed sliding window backend using ``redis.asyncio``.
+
+    Drop-in async replacement for RedisBackend. Uses the async interface
+    bundled in redis-py >= 4.2 — no extra package required beyond ``redis``.
+
+    Suitable for async FastAPI apps with multiple workers. Shares state across
+    processes via Redis.
+
+    Args:
+        url: Redis connection URL. Defaults to ``redis://localhost:6379``.
+        prefix: Key prefix applied to all rate limit keys. Defaults to ``rl:``.
+
+    Example::
+
+        from fastapi_limiter.backends import AsyncRedisBackend
+
+        backend = AsyncRedisBackend(url="redis://localhost:6379")
+    """
+
+    def __init__(self, url: str = "redis://localhost:6379", prefix: str = "rl:") -> None:
+        try:
+            import redis.asyncio as aioredis
+        except ImportError as e:
+            raise ImportError(
+                "AsyncRedisBackend requires the 'redis' package (>= 4.2). "
+                "Install it with: pip install redis"
+            ) from e
+
+        self._redis = aioredis.from_url(url, decode_responses=False)
+        self._prefix = prefix
+
+    def _full_key(self, key: str) -> str:
+        return f"{self._prefix}{key}"
+
+    async def is_allowed(self, key: str, limit: int, window: int) -> tuple[bool, int, int]:
+        import time
+
+        full_key = self._full_key(key)
+        now = time.time()
+        cutoff = now - window
+
+        pipe = self._redis.pipeline()
+        pipe.zremrangebyscore(full_key, "-inf", cutoff)
+        pipe.zrange(full_key, 0, -1, withscores=True)
+        pipe.zadd(full_key, {str(now).encode(): now})
+        pipe.expire(full_key, window + 1)
+        results = await pipe.execute()
+
+        existing: list[tuple[bytes, float]] = results[1]
+        count = len(existing)
+
+        if count >= limit:
+            oldest_score = existing[0][1] if existing else now
+            retry_after = int(oldest_score - cutoff) + 1
+            await self._redis.zrem(full_key, str(now).encode())
+            return False, 0, retry_after
+
+        return True, limit - count - 1, 0
+
+    async def reset(self, key: str) -> None:
+        await self._redis.delete(self._full_key(key))
