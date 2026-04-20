@@ -1,5 +1,6 @@
 """RateLimiter dependency for use with FastAPI routes."""
 
+import time
 from fastapi import Request, HTTPException
 from typing import Callable, Optional
 from fastapi_limiter.backends import Backend, InMemoryBackend
@@ -59,10 +60,12 @@ class RateLimiter:
     async def __call__(self, request: Request) -> None:
         key = self.key_func(request)
         allowed, remaining, retry_after = self.backend.is_allowed(key, self.limit, self.window)
+        reset_at = int(time.time()) + (retry_after if not allowed else self.window)
 
         request.state.ratelimit_remaining = remaining
         request.state.ratelimit_limit = self.limit
         request.state.ratelimit_window = self.window
+        request.state.ratelimit_reset = reset_at
 
         if not allowed:
             raise HTTPException(
@@ -73,6 +76,7 @@ class RateLimiter:
                     "X-RateLimit-Limit": str(self.limit),
                     "X-RateLimit-Remaining": "0",
                     "X-RateLimit-Window": str(self.window),
+                    "X-RateLimit-Reset": str(reset_at),
                 },
             )
 
@@ -138,6 +142,7 @@ class BurstLimiter:
             f"{key}:burst", self.burst_limit, self.burst_window
         )
         if not burst_allowed:
+            reset_at = int(time.time()) + burst_retry
             raise HTTPException(
                 status_code=429,
                 detail=f"Burst limit exceeded. Try again in {burst_retry}s.",
@@ -146,6 +151,7 @@ class BurstLimiter:
                     "X-RateLimit-Limit": str(self.burst_limit),
                     "X-RateLimit-Remaining": "0",
                     "X-RateLimit-Window": str(self.burst_window),
+                    "X-RateLimit-Reset": str(reset_at),
                 },
             )
 
@@ -153,6 +159,7 @@ class BurstLimiter:
             f"{key}:sustained", self.sustained_limit, self.sustained_window
         )
         if not sustained_allowed:
+            reset_at = int(time.time()) + sustained_retry
             raise HTTPException(
                 status_code=429,
                 detail=f"Sustained rate limit exceeded. Try again in {sustained_retry}s.",
@@ -161,5 +168,6 @@ class BurstLimiter:
                     "X-RateLimit-Limit": str(self.sustained_limit),
                     "X-RateLimit-Remaining": "0",
                     "X-RateLimit-Window": str(self.sustained_window),
+                    "X-RateLimit-Reset": str(reset_at),
                 },
             )
